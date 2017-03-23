@@ -1,0 +1,11 @@
+[package]
+name = "ritebot"
+version = "0.1.0"
+authors = ["Chris West (Faux) <git@goeswhere.com>"]
+
+[dependencies]
+diesel = { version = "0.12.0", features = ["sqlite"] }
+diesel_codegen = { version = "0.12.0", features = ["sqlite"] }
+dotenv = "0.9.0"
+irc = "0.11.6"
+
