@@ -2,7 +2,7 @@ use super::schema::timers;
 
 #[derive(Queryable)]
 pub struct Timer {
-    pub id: i64,
+    pub id: Option<i64>,
     pub at: i64,
     pub whom: String,
     pub operation: String,

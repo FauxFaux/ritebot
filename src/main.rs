@@ -8,11 +8,19 @@ pub mod models;
 
 use std::env;
 use std::io;
+use std::thread;
+use std::time;
+
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use irc::client::prelude::*;
+
+struct Bot {
+    earliest_wake: u64,
+}
 
 fn other(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Other, msg)
@@ -86,10 +94,10 @@ fn period() {
 
 fn now_ms() -> u64 {
     let dur = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-    return (dur.as_secs() * 1000) + (dur.subsec_nanos() as u64 / 1000);
+    return (dur.as_secs() * 1_000) + (dur.subsec_nanos() as u64 / 1_000_000);
 }
 
-fn command_in(conn: &SqliteConnection, whom: &str, arg: &str) -> io::Result<String> {
+fn command_in(conn: &SqliteConnection, bot: &mut Bot, whom: &str, arg: &str) -> io::Result<String> {
     let mut args = arg.splitn(3, ' ');
     let period = match args.next() {
         Some(val) => val,
@@ -124,13 +132,20 @@ fn command_in(conn: &SqliteConnection, whom: &str, arg: &str) -> io::Result<Stri
         operation: text,
     };
 
+    if when_ms < bot.earliest_wake {
+        bot.earliest_wake = when_ms;
+    }
+
     diesel::insert(&new_timer).into(schema::timers::table)
         .execute(conn).unwrap();
 
     Ok(format!("Will reply '{}' at '{}'", text, when_ms))
 }
 
-fn process<S: ServerExt>(server: &S, conn: &SqliteConnection, message: &Message) -> io::Result<()> {
+fn process<S: ServerExt>(server: &S,
+                         conn: &SqliteConnection,
+                         bot: &mut Bot,
+                         message: &Message) -> io::Result<()> {
     match message.command {
         Command::PRIVMSG(ref target, ref msg) => {
             let src = message.source_nickname().ok_or(other("no source nick on privmsg?"))?;
@@ -150,7 +165,7 @@ fn process<S: ServerExt>(server: &S, conn: &SqliteConnection, message: &Message)
             };
 
             let response = match command {
-                ("in", e) => command_in(conn, src, e)?,
+                ("in", e) => command_in(conn, bot, src, e)?,
                 (e, _) => format!("unknown command: {}", e),
             };
 
@@ -168,13 +183,65 @@ fn process<S: ServerExt>(server: &S, conn: &SqliteConnection, message: &Message)
     }
 }
 
+fn load_earliest(bot: &mut Bot, conn: &SqliteConnection) -> Result<(), String> {
+    use schema::timers::dsl::*;
+    use diesel::expression::dsl::min;
+
+    let next = timers.select(min(at)).get_result::<Option<i64>>(conn)
+        .map_err(|e| format!("next: {}", e))?;
+    bot.earliest_wake = next.unwrap_or(std::i64::MAX) as u64;
+    Ok(())
+}
+
+fn worker<S: ServerExt>(bot: &mut Bot, server: &S, conn: &SqliteConnection) -> Result<(), String> {
+    let now = now_ms();
+    if bot.earliest_wake > now {
+        return Ok(());
+    }
+
+    use schema::timers::dsl::*;
+    let passed = timers.filter(at.le(now as i64)).load::<models::Timer>(conn)
+        .map_err(|e| format!("select: {}", e))?;
+
+    if passed.is_empty() {
+        return Ok(());
+    }
+
+    for timer in passed {
+        server.send_notice(timer.whom.as_str(), timer.operation.as_str())
+            .map_err(|e| format!("send: {}", e))?;
+    }
+
+    diesel::delete(timers.filter(at.le(now as i64))).execute(conn)
+        .map_err(|e| format!("delete: {}", e))?;
+    load_earliest(bot, conn)?;
+    Ok(())
+}
+
 fn main() {
     let conn = establish_connection();
+    let arc = Arc::new(Mutex::new(Bot { earliest_wake: std::u64::MAX }));
     let server = IrcServer::new("config.json").unwrap();
     server.identify().unwrap();
+    {
+        let server = server.clone();
+        let arc = arc.clone();
+        thread::spawn(move || {
+            let conn = establish_connection();
+            loop {
+                thread::sleep(time::Duration::from_millis(2_000));
+                let mut bot = arc.lock().unwrap();
+                if let Err(e) = worker(&mut *bot, &server, &conn) {
+                    println!("thread problem: {}", e);
+                }
+            }
+        });
+    }
+    load_earliest(&mut *arc.lock().unwrap(), &conn).unwrap();
     for message_result in server.iter() {
         let message = message_result.expect("valid message");
-        if let Err(e) = process(&server, &conn, &message) {
+        let mut bot = arc.lock().unwrap();
+        if let Err(e) = process(&server, &conn, &mut bot, &message) {
             println!("failed processing {}: {}", message, e);
         }
     }
